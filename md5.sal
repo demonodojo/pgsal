@@ -1,0 +1,142 @@
+# pgsal/md5.sal — MD5 (RFC 1321) para la autenticación `md5` de PostgreSQL.
+# Los enteros son i64: cada operación de 32 bits se enmascara con 0xFFFFFFFF.
+
+fn md5_mask() -> Int
+    4294967295
+
+fn md5_rotl(x: Int, c: Int) -> Int
+    m = x & md5_mask()
+    ((m << c) | (m >> (32 - c))) & md5_mask()
+
+# K[i] = floor(2^32 * abs(sin(i + 1))), como 64 palabras hexadecimales de 8 dígitos.
+fn md5_k_table() -> String
+    "d76aa478e8c7b756242070dbc1bdceeef57c0faf4787c62aa8304613fd469501698098d88b44f7afffff5bb1895cd7be6b901122fd987193a679438e49b40821f61e2562c040b340265e5a51e9b6c7aad62f105d02441453d8a1e681e7d3fbc821e1cde6c33707d6f4d50d87455a14eda9e3e905fcefa3f8676f02d98d2a4c8afffa39428771f6816d9d6122fde5380ca4beea444bdecfa9f6bb4b60bebfbc70289b7ec6eaa127fad4ef308504881d05d9d4d039e6db99e51fa27cf8c4ac5665f4292244432aff97ab9423a7fc93a039655b59c38f0ccc92ffeff47d85845dd16fa87e4ffe2ce6e0a30143144e0811a1f7537e82bd3af2352ad7d2bbeb86d391"
+
+fn md5_hexval(c: Int) -> Int
+    if c >= 97
+        c - 87
+    else
+        c - 48
+
+fn md5_k(i: Int) -> Int
+    t = md5_k_table()
+    v = 0
+    j = 0
+    while j < 8
+        v = (v << 4) | md5_hexval(str_char(t, i * 8 + j))
+        j = j + 1
+    v
+
+# Desplazamientos por ronda: 4 valores por ronda, repetidos 4 veces.
+fn md5_s(i: Int) -> Int
+    r = i / 16
+    k = i % 4
+    if r == 0
+        if k == 0
+            return 7
+        if k == 1
+            return 12
+        if k == 2
+            return 17
+        return 22
+    if r == 1
+        if k == 0
+            return 5
+        if k == 1
+            return 9
+        if k == 2
+            return 14
+        return 20
+    if r == 2
+        if k == 0
+            return 4
+        if k == 1
+            return 11
+        if k == 2
+            return 16
+        return 23
+    if k == 0
+        return 6
+    if k == 1
+        return 10
+    if k == 2
+        return 15
+    21
+
+fn md5_hex_digit(v: Int) -> String ! alloc
+    if v < 10
+        char_to_str(48 + v)
+    else
+        char_to_str(87 + v)
+
+fn md5_word_hex(w: Int) -> String ! alloc
+    # Palabra little-endian → 8 dígitos hex.
+    out = ""
+    i = 0
+    while i < 4
+        b = (w >> (8 * i)) & 255
+        out = out + md5_hex_digit(b >> 4)
+        out = out + md5_hex_digit(b & 15)
+        i = i + 1
+    out
+
+# MD5 de los primeros `n` bytes de `src` como 32 caracteres hex en minúscula.
+fn md5_hex_bytes(src: Bytes, n: Int) -> String ! alloc
+    total = ((n + 8) / 64 + 1) * 64
+    buf = bytes_new(total)
+    x = bytes_fill(buf, 0, total, 0)
+    y = bytes_copy(buf, 0, src, 0, n)
+    z = bytes_set_u8(buf, n, 128)
+    bits = n * 8
+    k = 0
+    while k < 8
+        w = bytes_set_u8(buf, total - 8 + k, (bits >> (8 * k)) & 255)
+        k = k + 1
+    a0 = 1732584193
+    b0 = 4023233417
+    c0 = 2562383102
+    d0 = 271733878
+    off = 0
+    while off < total
+        a = a0
+        b = b0
+        c = c0
+        d = d0
+        i = 0
+        while i < 64
+            f = 0
+            g = 0
+            r = i / 16
+            if r == 0
+                f = (b & c) | ((b ^ md5_mask()) & d)
+                g = i
+            elsif r == 1
+                f = (d & b) | ((d ^ md5_mask()) & c)
+                g = (5 * i + 1) % 16
+            elsif r == 2
+                f = b ^ c ^ d
+                g = (3 * i + 5) % 16
+            else
+                f = c ^ (b | (d ^ md5_mask()))
+                g = (7 * i) % 16
+            m = bytes_get_u32(buf, off + g * 4)
+            f2 = (f + a + md5_k(i) + m) & md5_mask()
+            a = d
+            d = c
+            c = b
+            b = (b + md5_rotl(f2, md5_s(i))) & md5_mask()
+            i = i + 1
+        a0 = (a0 + a) & md5_mask()
+        b0 = (b0 + b) & md5_mask()
+        c0 = (c0 + c) & md5_mask()
+        d0 = (d0 + d) & md5_mask()
+        off = off + 64
+    md5_word_hex(a0) + md5_word_hex(b0) + md5_word_hex(c0) + md5_word_hex(d0)
+
+
+# MD5 de una cadena como 32 caracteres hex en minúscula.
+fn md5_hex(s: String) -> String ! alloc
+    n = str_len(s)
+    src = bytes_new(n + 1)
+    x = str_bytes_copy(src, 0, s)
+    md5_hex_bytes(src, n)

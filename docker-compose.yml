@@ -1,0 +1,21 @@
+# Postgres de pruebas para pgsal.
+#   docker compose up -d --wait
+#   sal test
+#   docker compose down -v
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: pgsal
+    ports:
+      - "127.0.0.1:55432:5432"
+    volumes:
+      # Crea usuarios con cada método de autenticación (md5, texto plano).
+      - ./initdb:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -U postgres -d pgsal"]
+      interval: 1s
+      timeout: 3s
+      retries: 30

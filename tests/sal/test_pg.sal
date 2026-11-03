@@ -1,0 +1,114 @@
+import "../../pg.sal"
+import "support/assert.sal"
+
+fn host() -> String
+    "127.0.0.1"
+
+fn port() -> Int
+    55432
+
+fn main() -> Int ! io, alloc
+    f = 0
+
+    # --- autenticación: md5 (hash), texto plano y trust
+    c = pg_connect(host(), port(), "sal_md5", "md5pass", "pgsal")
+    f = f + ck_int(pg_conn_ok(c), 1, 1)
+    f = f + ck_str(pg_conn_error(c), "", 2)
+
+    r = pg_query(c, "SELECT 1 AS uno, 'hola' AS saludo, NULL AS nada")
+    f = f + ck_int(pg_ok(r), 1, 3)
+    f = f + ck_int(pg_rows(r), 1, 4)
+    f = f + ck_int(pg_cols(r), 3, 5)
+    f = f + ck_str(pg_col_name(r, 1), "saludo", 6)
+    f = f + ck_int(pg_get_int(r, 0, 0), 1, 7)
+    f = f + ck_str(pg_get(r, 0, 1), "hola", 8)
+    f = f + ck_int(pg_is_null(r, 0, 2), 1, 9)
+    f = f + ck_int(pg_is_null(r, 0, 0), 0, 10)
+    f = f + ck_str(pg_tag(r), "SELECT 1", 11)
+
+    # --- DDL / DML
+    f = f + ck_str(pg_exec(c, "DROP TABLE IF EXISTS pgsal_t"), "", 20)
+    f = f + ck_str(pg_exec(c, "CREATE TABLE pgsal_t (id serial PRIMARY KEY, nombre text, edad int)"), "", 21)
+    r2 = pg_query(c, "INSERT INTO pgsal_t (nombre, edad) VALUES ('Ana', 30), ('Luis', 41), (" + pg_quote("O'Brien") + ", NULL)")
+    f = f + ck_int(pg_ok(r2), 1, 22)
+    f = f + ck_str(pg_tag(r2), "INSERT 0 3", 23)
+    f = f + ck_int(pg_affected(r2), 3, 24)
+
+    r3 = pg_query(c, "SELECT id, nombre, edad FROM pgsal_t ORDER BY id")
+    f = f + ck_int(pg_rows(r3), 3, 25)
+    f = f + ck_str(pg_get(r3, 0, 1), "Ana", 26)
+    f = f + ck_str(pg_get(r3, 2, 1), "O'Brien", 27)
+    f = f + ck_int(pg_is_null(r3, 2, 2), 1, 28)
+    f = f + ck_int(pg_get_int(r3, 1, 2), 41, 29)
+
+    # --- parámetros (protocolo extendido)
+    ps = sk_sl_new()
+    x = sk_sl_push(ps, "Marta")
+    x = sk_sl_push(ps, "27")
+    r4 = pg_query_params(c, "INSERT INTO pgsal_t (nombre, edad) VALUES ($1, $2) RETURNING id", ps)
+    f = f + ck_int(pg_ok(r4), 1, 30)
+    f = f + ck_int(pg_get_int(r4, 0, 0), 4, 31)
+
+    ps2 = sk_sl_new()
+    x = sk_sl_push(ps2, "Ana")
+    x = sk_sl_push(ps2, pg_null())
+    r5 = pg_query_params(c, "SELECT nombre, $2::int IS NULL AS esnulo FROM pgsal_t WHERE nombre = $1", ps2)
+    f = f + ck_int(pg_rows(r5), 1, 32)
+    f = f + ck_str(pg_get(r5, 0, 1), "t", 33)
+
+    ps3 = sk_sl_new()
+    x = sk_sl_push(ps3, "'; DROP TABLE pgsal_t; --")
+    r6 = pg_query_params(c, "SELECT count(*) FROM pgsal_t WHERE nombre = $1", ps3)
+    f = f + ck_int(pg_get_int(r6, 0, 0), 0, 34)
+
+    # --- errores del servidor y recuperación de la conexión
+    r7 = pg_query(c, "SELECT * FROM no_existe")
+    f = f + ck_int(pg_ok(r7), 0, 40)
+    f = f + ck_int(sk_contains(pg_error(r7), "42P01"), 1, 41)
+    r8 = pg_query(c, "SELECT 2 + 2")
+    f = f + ck_int(pg_get_int(r8, 0, 0), 4, 42)
+    r9 = pg_query_params(c, "SELECT $1::int", ps)
+    f = f + ck_int(pg_ok(r9), 0, 43)
+    r10 = pg_query(c, "SELECT 'sigue vivo'")
+    f = f + ck_str(pg_get(r10, 0, 0), "sigue vivo", 44)
+
+    # --- varias filas grandes y UTF-8
+    r11 = pg_query(c, "SELECT g, repeat('é', 100) FROM generate_series(1, 2000) g")
+    f = f + ck_int(pg_rows(r11), 2000, 50)
+    f = f + ck_int(str_len(pg_get(r11, 1999, 1)), 200, 51)
+    f = f + ck_int(pg_get_int(r11, 1999, 0), 2000, 52)
+
+    f = f + ck_str(pg_exec(c, "DROP TABLE pgsal_t"), "", 60)
+    x = pg_close(c)
+
+    c2 = pg_connect(host(), port(), "sal_plain", "plainpass", "pgsal")
+    f = f + ck_int(pg_conn_ok(c2), 1, 70)
+    f = f + ck_str(pg_get(pg_query(c2, "SELECT current_user"), 0, 0), "sal_plain", 71)
+    x = pg_close(c2)
+
+    c3 = pg_connect(host(), port(), "sal_trust", "", "pgsal")
+    f = f + ck_int(pg_conn_ok(c3), 1, 72)
+    x = pg_close(c3)
+
+    # --- SCRAM-SHA-256 (el método por defecto de PostgreSQL moderno)
+    c6 = pg_connect(host(), port(), "sal_scram", "scrampass", "pgsal")
+    f = f + ck_int(pg_conn_ok(c6), 1, 73)
+    f = f + ck_str(pg_conn_error(c6), "", 74)
+    f = f + ck_str(pg_get(pg_query(c6, "SELECT current_user"), 0, 0), "sal_scram", 75)
+    x = pg_close(c6)
+    c7 = pg_connect(host(), port(), "postgres", "postgres", "pgsal")
+    f = f + ck_int(pg_conn_ok(c7), 1, 76)
+    x = pg_close(c7)
+    c8 = pg_connect(host(), port(), "sal_scram", "mala", "pgsal")
+    f = f + ck_int(pg_conn_ok(c8), 0, 77)
+    f = f + ck_int(sk_contains(pg_conn_error(c8), "28P01"), 1, 78)
+
+    # --- fallos de conexión
+    c4 = pg_connect(host(), port(), "sal_md5", "mala", "pgsal")
+    f = f + ck_int(pg_conn_ok(c4), 0, 80)
+    f = f + ck_int(sk_contains(pg_conn_error(c4), "28P01"), 1, 81)
+    c5 = pg_connect(host(), 55999, "x", "x", "x")
+    f = f + ck_int(pg_conn_ok(c5), 0, 82)
+    r12 = pg_query(c5, "SELECT 1")
+    f = f + ck_int(pg_ok(r12), 0, 83)
+    f

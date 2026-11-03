@@ -1,0 +1,187 @@
+# pgsal/sha256.sal — SHA-256, HMAC-SHA-256 y PBKDF2 para la autenticación SCRAM de PostgreSQL.
+# Los enteros son i64: cada operación de 32 bits se enmascara con 0xFFFFFFFF.
+# Los resúmenes son `Bytes` de 32 bytes; quien los recibe los libera con `bytes_free`.
+
+fn sha_mask() -> Int
+    4294967295
+
+fn sha_rotr(x: Int, c: Int) -> Int
+    m = x & sha_mask()
+    ((m >> c) | (m << (32 - c))) & sha_mask()
+
+# K[i]: primeros 32 bits de la parte fraccionaria de la raíz cúbica de los 64 primeros primos.
+fn sha_k_table() -> String
+    "428a2f9871374491b5c0fbcfe9b5dba53956c25b59f111f1923f82a4ab1c5ed5d807aa9812835b01243185be550c7dc372be5d7480deb1fe9bdc06a7c19bf174e49b69c1efbe47860fc19dc6240ca1cc2de92c6f4a7484aa5cb0a9dc76f988da983e5152a831c66db00327c8bf597fc7c6e00bf3d5a7914706ca63511429296727b70a852e1b21384d2c6dfc53380d13650a7354766a0abb81c2c92e92722c85a2bfe8a1a81a664bc24b8b70c76c51a3d192e819d6990624f40e3585106aa07019a4c1161e376c082748774c34b0bcb5391c0cb34ed8aa4a5b9cca4f682e6ff3748f82ee78a5636f84c878148cc7020890befffaa4506cebbef9a3f7c67178f2"
+
+# H0: raíces cuadradas de los 8 primeros primos.
+fn sha_h_table() -> String
+    "6a09e667bb67ae853c6ef372a54ff53a510e527f9b05688c1f83d9ab5be0cd19"
+
+fn sha_hexval(c: Int) -> Int
+    if c >= 97
+        c - 87
+    else
+        c - 48
+
+fn sha_hex_word(t: String, i: Int) -> Int
+    v = 0
+    j = 0
+    while j < 8
+        v = (v << 4) | sha_hexval(str_char(t, i * 8 + j))
+        j = j + 1
+    v
+
+fn sha_put_be32(b: Bytes, off: Int, v: Int) -> Int
+    x = bytes_set_u8(b, off, (v >> 24) & 255)
+    x = bytes_set_u8(b, off + 1, (v >> 16) & 255)
+    x = bytes_set_u8(b, off + 2, (v >> 8) & 255)
+    x = bytes_set_u8(b, off + 3, v & 255)
+    off + 4
+
+fn sha_get_be32(b: Bytes, off: Int) -> Int
+    (bytes_get_u8(b, off) << 24) | (bytes_get_u8(b, off + 1) << 16) | (bytes_get_u8(b, off + 2) << 8) | bytes_get_u8(b, off + 3)
+
+# SHA-256 de los primeros `n` bytes de `src`.
+fn sha256(src: Bytes, n: Int) -> Bytes ! alloc
+    total = ((n + 8) / 64 + 1) * 64
+    buf = bytes_new(total)
+    x = bytes_fill(buf, 0, total, 0)
+    y = bytes_copy(buf, 0, src, 0, n)
+    z = bytes_set_u8(buf, n, 128)
+    bits = n * 8
+    k = 0
+    while k < 8
+        w = bytes_set_u8(buf, total - 1 - k, (bits >> (8 * k)) & 255)
+        k = k + 1
+    kt = sha_k_table()
+    ktab = bytes_new(64 * 4)
+    i = 0
+    while i < 64
+        q = sha_put_be32(ktab, i * 4, sha_hex_word(kt, i))
+        i = i + 1
+    ht = sha_h_table()
+    h0 = sha_hex_word(ht, 0)
+    h1 = sha_hex_word(ht, 1)
+    h2 = sha_hex_word(ht, 2)
+    h3 = sha_hex_word(ht, 3)
+    h4 = sha_hex_word(ht, 4)
+    h5 = sha_hex_word(ht, 5)
+    h6 = sha_hex_word(ht, 6)
+    h7 = sha_hex_word(ht, 7)
+    ws = bytes_new(64 * 4)
+    off = 0
+    while off < total
+        i = 0
+        while i < 16
+            q = sha_put_be32(ws, i * 4, sha_get_be32(buf, off + i * 4))
+            i = i + 1
+        while i < 64
+            w15 = sha_get_be32(ws, (i - 15) * 4)
+            w2 = sha_get_be32(ws, (i - 2) * 4)
+            s0 = sha_rotr(w15, 7) ^ sha_rotr(w15, 18) ^ (w15 >> 3)
+            s1 = sha_rotr(w2, 17) ^ sha_rotr(w2, 19) ^ (w2 >> 10)
+            v = (sha_get_be32(ws, (i - 16) * 4) + s0 + sha_get_be32(ws, (i - 7) * 4) + s1) & sha_mask()
+            q = sha_put_be32(ws, i * 4, v)
+            i = i + 1
+        a = h0
+        b = h1
+        c = h2
+        d = h3
+        e = h4
+        f = h5
+        g = h6
+        h = h7
+        i = 0
+        while i < 64
+            s1 = sha_rotr(e, 6) ^ sha_rotr(e, 11) ^ sha_rotr(e, 25)
+            ch = (e & f) ^ ((e ^ sha_mask()) & g)
+            t1 = (h + s1 + ch + sha_get_be32(ktab, i * 4) + sha_get_be32(ws, i * 4)) & sha_mask()
+            s0 = sha_rotr(a, 2) ^ sha_rotr(a, 13) ^ sha_rotr(a, 22)
+            maj = (a & b) ^ (a & c) ^ (b & c)
+            t2 = (s0 + maj) & sha_mask()
+            h = g
+            g = f
+            f = e
+            e = (d + t1) & sha_mask()
+            d = c
+            c = b
+            b = a
+            a = (t1 + t2) & sha_mask()
+            i = i + 1
+        h0 = (h0 + a) & sha_mask()
+        h1 = (h1 + b) & sha_mask()
+        h2 = (h2 + c) & sha_mask()
+        h3 = (h3 + d) & sha_mask()
+        h4 = (h4 + e) & sha_mask()
+        h5 = (h5 + f) & sha_mask()
+        h6 = (h6 + g) & sha_mask()
+        h7 = (h7 + h) & sha_mask()
+        off = off + 64
+    out = bytes_new(32)
+    q = sha_put_be32(out, 0, h0)
+    q = sha_put_be32(out, 4, h1)
+    q = sha_put_be32(out, 8, h2)
+    q = sha_put_be32(out, 12, h3)
+    q = sha_put_be32(out, 16, h4)
+    q = sha_put_be32(out, 20, h5)
+    q = sha_put_be32(out, 24, h6)
+    q = sha_put_be32(out, 28, h7)
+    q = bytes_free(buf)
+    q = bytes_free(ktab)
+    q = bytes_free(ws)
+    out
+
+# HMAC-SHA-256(key[0..klen], msg[0..mlen]).
+fn hmac_sha256(key: Bytes, klen: Int, msg: Bytes, mlen: Int) -> Bytes ! alloc
+    k = bytes_new(64)
+    x = bytes_fill(k, 0, 64, 0)
+    if klen > 64
+        hk = sha256(key, klen)
+        x = bytes_copy(k, 0, hk, 0, 32)
+        x = bytes_free(hk)
+    else
+        x = bytes_copy(k, 0, key, 0, klen)
+    inner = bytes_new(64 + mlen)
+    i = 0
+    while i < 64
+        x = bytes_set_u8(inner, i, bytes_get_u8(k, i) ^ 54)
+        i = i + 1
+    x = bytes_copy(inner, 64, msg, 0, mlen)
+    ih = sha256(inner, 64 + mlen)
+    outer = bytes_new(96)
+    i = 0
+    while i < 64
+        x = bytes_set_u8(outer, i, bytes_get_u8(k, i) ^ 92)
+        i = i + 1
+    x = bytes_copy(outer, 64, ih, 0, 32)
+    r = sha256(outer, 96)
+    x = bytes_free(k)
+    x = bytes_free(inner)
+    x = bytes_free(ih)
+    x = bytes_free(outer)
+    r
+
+# PBKDF2-HMAC-SHA-256 con un solo bloque de salida (32 bytes). `salt` ya en bytes.
+fn pbkdf2_sha256(pass: Bytes, plen: Int, salt: Bytes, slen: Int, iters: Int) -> Bytes ! alloc
+    first = bytes_new(slen + 4)
+    x = bytes_copy(first, 0, salt, 0, slen)
+    x = bytes_set_u8(first, slen, 0)
+    x = bytes_set_u8(first, slen + 1, 0)
+    x = bytes_set_u8(first, slen + 2, 0)
+    x = bytes_set_u8(first, slen + 3, 1)
+    u = hmac_sha256(pass, plen, first, slen + 4)
+    x = bytes_free(first)
+    acc = bytes_new(32)
+    x = bytes_copy(acc, 0, u, 0, 32)
+    n = 1
+    while n < iters
+        nu = hmac_sha256(pass, plen, u, 32)
+        x = bytes_free(u)
+        u = nu
+        i = 0
+        while i < 32
+            y = bytes_set_u8(acc, i, bytes_get_u8(acc, i) ^ bytes_get_u8(u, i))
+            i = i + 1
+        n = n + 1
+    x = bytes_free(u)
+    acc

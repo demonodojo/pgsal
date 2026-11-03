@@ -1,0 +1,44 @@
+import "../../sha256.sal"
+import "support/assert.sal"
+
+fn hex_of(b: Bytes, n: Int) -> String ! alloc
+    out = ""
+    i = 0
+    while i < n
+        v = bytes_get_u8(b, i)
+        out = out + char_to_str(sha_hexchar(v >> 4)) + char_to_str(sha_hexchar(v & 15))
+        i = i + 1
+    out
+
+fn sha_hexchar(v: Int) -> Int
+    if v < 10
+        48 + v
+    else
+        87 + v
+
+fn sha_str(s: String) -> String ! alloc
+    b = bytes_new(str_len(s) + 1)
+    x = str_bytes_copy(b, 0, s)
+    hex_of(sha256(b, str_len(s)), 32)
+
+fn hmac_str(k: String, m: String) -> String ! alloc
+    kb = bytes_new(str_len(k) + 1)
+    x = str_bytes_copy(kb, 0, k)
+    mb = bytes_new(str_len(m) + 1)
+    y = str_bytes_copy(mb, 0, m)
+    hex_of(hmac_sha256(kb, str_len(k), mb, str_len(m)), 32)
+
+fn main() -> Int ! io, alloc
+    f = 0
+    f = f + ck_str(sha_str(""), "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855", 1)
+    f = f + ck_str(sha_str("abc"), "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad", 2)
+    f = f + ck_str(sha_str("abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq"), "248d6a61d20638b8e5c026930c3e6039a33ce45964ff2167f6ecedd419db06c1", 3)
+    f = f + ck_str(hmac_str("key", "The quick brown fox jumps over the lazy dog"), "f7bc83f430538424b13298e6aa6fb143ef4d59a14946175997479dbc2d1a3cd8", 4)
+    # RFC 7914: PBKDF2-HMAC-SHA-256("passwd", "salt", 1) primeros 32 bytes
+    pb = bytes_new(8)
+    x = str_bytes_copy(pb, 0, "passwd")
+    sb = bytes_new(8)
+    y = str_bytes_copy(sb, 0, "salt")
+    f = f + ck_str(hex_of(pbkdf2_sha256(pb, 6, sb, 4, 1), 32), "55ac046e56e3089fec1691c22544b605f94185216dde0465e68b9d57c20dacbc", 5)
+    f = f + ck_str(hex_of(pbkdf2_sha256(pb, 6, sb, 4, 4096), 32), "21943fd5b7a10905c38fad60157ff498e1e81df1e03254325682a74dca3b2be8", 6)
+    f

@@ -1,0 +1,549 @@
+# pgsal/pg.sal — cliente PostgreSQL en sal puro (protocolo v3 sobre TCP, sin TLS).
+#
+#   c = pg_connect("127.0.0.1", 5432, "postgres", "secreto", "mibd")
+#   if pg_conn_ok(c) == 0
+#       ... pg_conn_error(c)
+#   r = pg_query(c, "SELECT id, nombre FROM t")            # protocolo simple
+#   r = pg_query_params(c, "SELECT * FROM t WHERE id = $1", ps)   # protocolo extendido
+#   pg_ok(r) pg_error(r) pg_rows(r) pg_cols(r) pg_get(r, fila, col) pg_is_null(r, fila, col)
+#   pg_close(c)
+#
+# Autenticación: trust, password (texto plano), md5 y SCRAM-SHA-256. Todos los valores llegan como texto.
+# Los parámetros de `pg_query_params` son una lista de cadenas de salkit (sk_sl_*);
+# `pg_null()` es el valor que se envía como NULL.
+
+import "io/io.sal"
+import "io/net.sal"
+import "io/time.sal"
+import "salkit/strbuf.sal"
+import "salkit/int.sal"
+import "md5.sal"
+import "scram.sal"
+
+# Conexión: `fd` (<0 si falló) y el motivo del fallo.
+struct PgConn
+    fd: Int
+    err: String
+
+# Resultado de una consulta. `names`, `cells` y `nulls` son asas (vec) de columnas y celdas
+# en orden de fila.
+struct PgResult
+    ok: Int
+    err: String
+    tag: String
+    ncols: Int
+    nrows: Int
+    names: Int
+    cells: Int
+    nulls: Int
+
+# Mensaje recibido: tipo, longitud del cuerpo y cuerpo.
+struct PgMsg
+    kind: Int
+    len: Int
+    body: Bytes
+    err: String
+
+fn pg_timeout_ms() -> Int
+    30000
+
+# ------------------------------------------------------------------ accesores
+
+fn pg_conn_ok(c: PgConn) -> Int
+    if c.fd >= 0
+        1
+    else
+        0
+
+fn pg_conn_error(c: PgConn) -> String
+    c.err
+
+fn pg_ok(r: PgResult) -> Int
+    r.ok
+
+fn pg_error(r: PgResult) -> String
+    r.err
+
+# Etiqueta de CommandComplete, p. ej. "INSERT 0 1" o "SELECT 3".
+fn pg_tag(r: PgResult) -> String
+    r.tag
+
+fn pg_rows(r: PgResult) -> Int
+    r.nrows
+
+fn pg_cols(r: PgResult) -> Int
+    r.ncols
+
+fn pg_col_name(r: PgResult, col: Int) -> String
+    if col < 0
+        return ""
+    if col >= r.ncols
+        return ""
+    str_from_int(vec_get(r.names, col))
+
+fn pg_is_null(r: PgResult, row: Int, col: Int) -> Int
+    if row < 0
+        return 1
+    if row >= r.nrows
+        return 1
+    if col < 0
+        return 1
+    if col >= r.ncols
+        return 1
+    vec_get(r.nulls, row * r.ncols + col)
+
+# Valor de la celda como texto ("" si es NULL o está fuera de rango).
+fn pg_get(r: PgResult, row: Int, col: Int) -> String
+    if pg_is_null(r, row, col) != 0
+        return ""
+    str_from_int(vec_get(r.cells, row * r.ncols + col))
+
+fn pg_get_int(r: PgResult, row: Int, col: Int) -> Int ! alloc
+    s = pg_get(r, row, col)
+    if str_len(s) > 0
+        if str_char(s, 0) == 45
+            return 0 - sk_parse_int(str_slice(s, 1, str_len(s)))
+    sk_parse_int(s)
+
+# Filas afectadas según la etiqueta (último número); 0 si no hay.
+fn pg_affected(r: PgResult) -> Int ! alloc
+    t = r.tag
+    n = str_len(t)
+    i = n - 1
+    while i >= 0
+        if str_char(t, i) == 32
+            return sk_parse_int(str_slice(t, i + 1, n))
+        i = i - 1
+    0
+
+fn pg_result_err(msg: String) -> PgResult ! alloc
+    PgResult(0, msg, "", 0, 0, vec_new(), vec_new(), vec_new())
+
+# ------------------------------------------------------------------ escritura de mensajes
+
+fn pw_u8(b: Bytes, off: Int, v: Int) -> Int
+    x = bytes_set_u8(b, off, v & 255)
+    off + 1
+
+fn pw_i16(b: Bytes, off: Int, v: Int) -> Int
+    o = pw_u8(b, off, v >> 8)
+    pw_u8(b, o, v)
+
+fn pw_i32(b: Bytes, off: Int, v: Int) -> Int
+    o = pw_u8(b, off, v >> 24)
+    o = pw_u8(b, o, v >> 16)
+    o = pw_u8(b, o, v >> 8)
+    pw_u8(b, o, v)
+
+# Bytes de la cadena sin terminador.
+fn pw_raw(b: Bytes, off: Int, s: String) -> Int
+    n = str_len(s)
+    if n > 0
+        x = str_bytes_copy(b, off, s)
+    off + n
+
+# Cadena con terminador NUL.
+fn pw_cstr(b: Bytes, off: Int, s: String) -> Int
+    o = pw_raw(b, off, s)
+    pw_u8(b, o, 0)
+
+# ------------------------------------------------------------------ lectura de mensajes
+
+fn pr_u8(b: Bytes, off: Int) -> Int
+    bytes_get_u8(b, off)
+
+fn pr_i16(b: Bytes, off: Int) -> Int
+    (bytes_get_u8(b, off) << 8) | bytes_get_u8(b, off + 1)
+
+# Entero de 32 bits con signo, big-endian.
+fn pr_i32(b: Bytes, off: Int) -> Int
+    v = (bytes_get_u8(b, off) << 24) | (bytes_get_u8(b, off + 1) << 16) | (bytes_get_u8(b, off + 2) << 8) | bytes_get_u8(b, off + 3)
+    if v >= 2147483648
+        v - 4294967296
+    else
+        v
+
+# Posición del NUL a partir de `off`; `limit` si no hay.
+fn pr_cstr_end(b: Bytes, off: Int, limit: Int) -> Int
+    i = off
+    while i < limit
+        if bytes_get_u8(b, i) == 0
+            return i
+        i = i + 1
+    limit
+
+fn pr_str(b: Bytes, off: Int, n: Int) -> String ! alloc
+    if n <= 0
+        return ""
+    bytes_to_str(bytes_view(b, off, n))
+
+# ------------------------------------------------------------------ red
+
+fn pg_send(fd: Int, b: Bytes, n: Int) -> Int ! io
+    pos = 0
+    while pos < n
+        k = write_fd(fd, bytes_ptr(b) + pos, n - pos)
+        if k <= 0
+            return 1
+        pos = pos + k
+    0
+
+# Lee exactamente `n` bytes en `buf` desde `off`. 0 si ok; 1 error o cierre; 2 plazo.
+fn pg_read_exact(fd: Int, buf: Bytes, off: Int, n: Int, timeout_ms: Int) -> Int ! io
+    deadline = uptime_ms() + timeout_ms
+    got = 0
+    while got < n
+        left = deadline - uptime_ms()
+        if left <= 0
+            return 2
+        slice = left
+        if slice > 200
+            slice = 200
+        k = read_timeout_fd(fd, bytes_ptr(buf) + off + got, n - got, slice)
+        if k > 0
+            got = got + k
+        elsif k == 0
+            return 1
+        elsif k != 0 - 11
+            return 1
+    0
+
+fn pg_msg_fail(why: String) -> PgMsg ! alloc
+    PgMsg(0, 0, bytes_new(1), why)
+
+fn pg_read_msg(fd: Int) -> PgMsg ! io, alloc
+    hdr = bytes_new(5)
+    rc = pg_read_exact(fd, hdr, 0, 5, pg_timeout_ms())
+    if rc != 0
+        x = bytes_free(hdr)
+        if rc == 2
+            return pg_msg_fail("timeout leyendo del servidor")
+        return pg_msg_fail("conexión cerrada por el servidor")
+    kind = pr_u8(hdr, 0)
+    total = pr_i32(hdr, 1)
+    x = bytes_free(hdr)
+    n = total - 4
+    if n < 0
+        return pg_msg_fail("mensaje corrupto")
+    body = bytes_new(n + 1)
+    if n > 0
+        rc2 = pg_read_exact(fd, body, 0, n, pg_timeout_ms())
+        if rc2 != 0
+            return pg_msg_fail("conexión cerrada a mitad de mensaje")
+    PgMsg(kind, n, body, "")
+
+# ErrorResponse / NoticeResponse → "SEVERIDAD SQLSTATE: mensaje".
+fn pg_parse_error(m: PgMsg) -> String ! alloc
+    sev = ""
+    code = ""
+    text = ""
+    i = 0
+    while i < m.len
+        f = pr_u8(m.body, i)
+        if f == 0
+            i = m.len
+        else
+            e = pr_cstr_end(m.body, i + 1, m.len)
+            v = pr_str(m.body, i + 1, e - (i + 1))
+            if f == 83
+                sev = v
+            elsif f == 67
+                code = v
+            elsif f == 77
+                text = v
+            i = e + 1
+    sev + " " + code + ": " + text
+
+# ------------------------------------------------------------------ conexión
+
+fn pg_conn_fail(why: String) -> PgConn
+    PgConn(0 - 1, why)
+
+fn pg_connect_fd(host: String, port: Int) -> Int ! io, alloc
+    if str_eq(host, "127.0.0.1") != 0
+        return tcp_connect_loopback(port, 5000)
+    if str_eq(host, "localhost") != 0
+        return tcp_connect_loopback(port, 5000)
+    tcp_connect_host(host, port, 5000)
+
+# "md5" + md5(md5(password + user) + salt)
+fn pg_md5_password(user: String, password: String, salt: Bytes, salt_off: Int) -> String ! alloc
+    inner = md5_hex(password + user)
+    buf = bytes_new(40)
+    x = str_bytes_copy(buf, 0, inner)
+    x = bytes_copy(buf, 32, salt, salt_off, 4)
+    "md5" + md5_hex_bytes(buf, 36)
+
+fn pg_send_password(fd: Int, pass: String) -> Int ! io, alloc
+    n = str_len(pass)
+    b = bytes_new(n + 7)
+    o = pw_u8(b, 0, 112)
+    o = pw_i32(b, o, n + 5)
+    o = pw_cstr(b, o, pass)
+    pg_send(fd, b, o)
+
+# SASLInitialResponse con el mecanismo SCRAM-SHA-256.
+fn pg_send_sasl_initial(fd: Int, first: String) -> Int ! io, alloc
+    mech = "SCRAM-SHA-256"
+    n = str_len(first)
+    total = 4 + str_len(mech) + 1 + 4 + n
+    b = bytes_new(total + 8)
+    o = pw_u8(b, 0, 112)
+    o = pw_i32(b, o, total)
+    o = pw_cstr(b, o, mech)
+    o = pw_i32(b, o, n)
+    o = pw_raw(b, o, first)
+    pg_send(fd, b, o)
+
+fn pg_send_sasl_response(fd: Int, data: String) -> Int ! io, alloc
+    n = str_len(data)
+    b = bytes_new(n + 8)
+    o = pw_u8(b, 0, 112)
+    o = pw_i32(b, o, 4 + n)
+    o = pw_raw(b, o, data)
+    pg_send(fd, b, o)
+
+# Abre la conexión y completa la autenticación hasta ReadyForQuery.
+fn pg_connect(host: String, port: Int, user: String, password: String, database: String) -> PgConn ! io, alloc
+    fd = pg_connect_fd(host, port)
+    if fd < 0
+        return pg_conn_fail("no se pudo conectar a " + host + ":" + int_to_str(port))
+    size = 4 + 4 + 5 + str_len(user) + 1 + 9 + str_len(database) + 1 + 1
+    b = bytes_new(size + 8)
+    o = pw_i32(b, 0, size)
+    o = pw_i32(b, o, 196608)
+    o = pw_cstr(b, o, "user")
+    o = pw_cstr(b, o, user)
+    o = pw_cstr(b, o, "database")
+    o = pw_cstr(b, o, database)
+    o = pw_u8(b, o, 0)
+    if pg_send(fd, b, o) != 0
+        x = close_fd(fd)
+        return pg_conn_fail("fallo enviando StartupMessage")
+    done = 0
+    err = ""
+    cnonce = ""
+    bare = ""
+    expect_sig = ""
+    while done == 0
+        m = pg_read_msg(fd)
+        if str_len(m.err) > 0
+            err = m.err
+            done = 2
+        elsif m.kind == 82
+            code = pr_i32(m.body, 0)
+            if code == 0
+                done = 0
+            elsif code == 3
+                if pg_send_password(fd, password) != 0
+                    err = "fallo enviando la contraseña"
+                    done = 2
+            elsif code == 5
+                if pg_send_password(fd, pg_md5_password(user, password, m.body, 4)) != 0
+                    err = "fallo enviando la contraseña md5"
+                    done = 2
+            elsif code == 10
+                cnonce = scram_nonce()
+                bare = "n=,r=" + cnonce
+                first = "n,," + bare
+                if pg_send_sasl_initial(fd, first) != 0
+                    err = "fallo enviando SASLInitialResponse"
+                    done = 2
+            elsif code == 11
+                proof = scram_proof(password, bare, cnonce, pr_str(m.body, 4, m.len - 4))
+                if str_len(proof.err) > 0
+                    err = proof.err
+                    done = 2
+                else
+                    expect_sig = proof.server_sig
+                    if pg_send_sasl_response(fd, proof.final) != 0
+                        err = "fallo enviando SASLResponse"
+                        done = 2
+            elsif code == 12
+                got = pr_str(m.body, 4, m.len - 4)
+                if str_eq(got, "v=" + expect_sig) == 0
+                    err = "SCRAM: la firma del servidor no coincide"
+                    done = 2
+            else
+                err = "método de autenticación no soportado (código " + int_to_str(code) + ")"
+                done = 2
+        elsif m.kind == 69
+            err = pg_parse_error(m)
+            done = 2
+        elsif m.kind == 90
+            done = 1
+        x = bytes_free(m.body)
+    if done == 2
+        y = close_fd(fd)
+        return pg_conn_fail(err)
+    PgConn(fd, "")
+
+# Envía Terminate y cierra el socket.
+fn pg_close(c: PgConn) -> Int ! io, alloc
+    if c.fd < 0
+        return 0
+    b = bytes_new(5)
+    o = pw_u8(b, 0, 88)
+    o = pw_i32(b, o, 4)
+    x = pg_send(c.fd, b, o)
+    close_fd(c.fd)
+
+# ------------------------------------------------------------------ consultas
+
+# Lee respuestas hasta ReadyForQuery y arma el resultado.
+fn pg_collect(fd: Int) -> PgResult ! io, alloc
+    names = vec_new()
+    cells = vec_new()
+    nulls = vec_new()
+    ncols = 0
+    nrows = 0
+    tag = ""
+    err = ""
+    done = 0
+    while done == 0
+        m = pg_read_msg(fd)
+        if str_len(m.err) > 0
+            err = m.err
+            done = 2
+        elsif m.kind == 84
+            ncols = pr_i16(m.body, 0)
+            off = 2
+            i = 0
+            while i < ncols
+                e = pr_cstr_end(m.body, off, m.len)
+                x = vec_push(names, str_as_int(pr_str(m.body, off, e - off)))
+                off = e + 1 + 18
+                i = i + 1
+        elsif m.kind == 68
+            n = pr_i16(m.body, 0)
+            off = 2
+            i = 0
+            while i < n
+                len = pr_i32(m.body, off)
+                off = off + 4
+                if len < 0
+                    x = vec_push(cells, str_as_int(""))
+                    y = vec_push(nulls, 1)
+                else
+                    x = vec_push(cells, str_as_int(pr_str(m.body, off, len)))
+                    y = vec_push(nulls, 0)
+                    off = off + len
+                i = i + 1
+            nrows = nrows + 1
+        elsif m.kind == 67
+            tag = pr_str(m.body, 0, pr_cstr_end(m.body, 0, m.len))
+        elsif m.kind == 69
+            if str_len(err) == 0
+                err = pg_parse_error(m)
+        elsif m.kind == 90
+            done = 1
+        x = bytes_free(m.body)
+    if done == 2
+        return pg_result_err(err)
+    ok = 1
+    if str_len(err) > 0
+        ok = 0
+    PgResult(ok, err, tag, ncols, nrows, names, cells, nulls)
+
+# Consulta con el protocolo simple. Admite varias sentencias; se devuelve el último resultado.
+fn pg_query(c: PgConn, sql: String) -> PgResult ! io, alloc
+    if c.fd < 0
+        return pg_result_err("conexión cerrada")
+    n = str_len(sql)
+    b = bytes_new(n + 8)
+    o = pw_u8(b, 0, 81)
+    o = pw_i32(b, o, n + 5)
+    o = pw_cstr(b, o, sql)
+    if pg_send(c.fd, b, o) != 0
+        x = bytes_free(b)
+        return pg_result_err("fallo enviando la consulta")
+    x = bytes_free(b)
+    pg_collect(c.fd)
+
+# Valor que se envía como NULL en `pg_query_params`.
+fn pg_null() -> String ! alloc
+    char_to_str(1) + "pgsal:null"
+
+fn pg_param_is_null(s: String) -> Int ! alloc
+    str_eq(s, pg_null())
+
+# Bytes que ocupan los parámetros en Bind: longitud (4) + valor; NULL solo ocupa la longitud.
+fn pg_params_size(params: Int) -> Int ! alloc
+    total = 0
+    i = 0
+    while i < sk_sl_len(params)
+        p = sk_sl_get(params, i)
+        total = total + 4
+        if pg_param_is_null(p) == 0
+            total = total + str_len(p)
+        i = i + 1
+    total
+
+# Consulta con parámetros $1, $2, … (protocolo extendido, valores en texto).
+fn pg_query_params(c: PgConn, sql: String, params: Int) -> PgResult ! io, alloc
+    if c.fd < 0
+        return pg_result_err("conexión cerrada")
+    np = sk_sl_len(params)
+    size = 1 + 4 + 1 + str_len(sql) + 1 + 2
+    size = size + 1 + 4 + 1 + 1 + 2 + 2 + 2
+    size = size + 7 + 10 + 5
+    size = size + pg_params_size(params)
+    b = bytes_new(size + 16)
+    # Parse: sentencia sin nombre, sin tipos declarados.
+    o = pw_u8(b, 0, 80)
+    o = pw_i32(b, o, 4 + 1 + str_len(sql) + 1 + 2)
+    o = pw_cstr(b, o, "")
+    o = pw_cstr(b, o, sql)
+    o = pw_i16(b, o, 0)
+    # Bind: parámetros en texto, resultados en texto.
+    blen = 4 + 1 + 1 + 2 + 2 + 2 + pg_params_size(params)
+    o = pw_u8(b, o, 66)
+    o = pw_i32(b, o, blen)
+    o = pw_cstr(b, o, "")
+    o = pw_cstr(b, o, "")
+    o = pw_i16(b, o, 0)
+    o = pw_i16(b, o, np)
+    i = 0
+    while i < np
+        p = sk_sl_get(params, i)
+        if pg_param_is_null(p) != 0
+            o = pw_i32(b, o, 0 - 1)
+        else
+            o = pw_i32(b, o, str_len(p))
+            o = pw_raw(b, o, p)
+        i = i + 1
+    o = pw_i16(b, o, 0)
+    # Describe portal, Execute, Sync.
+    o = pw_u8(b, o, 68)
+    o = pw_i32(b, o, 6)
+    o = pw_u8(b, o, 80)
+    o = pw_cstr(b, o, "")
+    o = pw_u8(b, o, 69)
+    o = pw_i32(b, o, 9)
+    o = pw_cstr(b, o, "")
+    o = pw_i32(b, o, 0)
+    o = pw_u8(b, o, 83)
+    o = pw_i32(b, o, 4)
+    if pg_send(c.fd, b, o) != 0
+        x = bytes_free(b)
+        return pg_result_err("fallo enviando la consulta")
+    x = bytes_free(b)
+    pg_collect(c.fd)
+
+# Ejecuta una sentencia sin resultado; devuelve "" si fue bien o el error.
+fn pg_exec(c: PgConn, sql: String) -> String ! io, alloc
+    r = pg_query(c, sql)
+    if pg_ok(r) != 0
+        ""
+    else
+        pg_error(r)
+
+# ------------------------------------------------------------------ escapado
+
+# Literal SQL entre comillas simples (para el protocolo simple).
+fn pg_quote(s: String) -> String ! alloc
+    "'" + sk_replace_all(s, "'", "''") + "'"
+
+# Identificador SQL entre comillas dobles.
+fn pg_quote_ident(s: String) -> String ! alloc
+    "\"" + sk_replace_all(s, "\"", "\"\"") + "\""

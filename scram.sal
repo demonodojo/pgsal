@@ -1,0 +1,116 @@
+# pgsal/scram.sal — SCRAM-SHA-256 (RFC 5802 / 7677) del lado cliente, para PostgreSQL.
+
+import "io/io.sal"
+import "io/rand.sal"
+import "salkit/base64.sal"
+import "salkit/strbuf.sal"
+import "salkit/int.sal"
+import "sha256.sal"
+
+fn b64_val(c: Int) -> Int
+    if c >= 65
+        if c <= 90
+            return c - 65
+    if c >= 97
+        if c <= 122
+            return c - 71
+    if c >= 48
+        if c <= 57
+            return c + 4
+    if c == 43
+        return 62
+    if c == 47
+        return 63
+    0 - 1
+
+# Decodifica base64 estándar (con o sin relleno) a un Bytes de longitud exacta.
+fn b64_decode(s: String) -> Bytes ! alloc
+    n = str_len(s)
+    while n > 0
+        if str_char(s, n - 1) == 61
+            n = n - 1
+        else
+            return b64_decode_n(s, n)
+    b64_decode_n(s, n)
+
+fn b64_decode_n(s: String, n: Int) -> Bytes ! alloc
+    outlen = n * 6 / 8
+    out = bytes_new(outlen + 1)
+    acc = 0
+    bits = 0
+    o = 0
+    i = 0
+    while i < n
+        v = b64_val(str_char(s, i))
+        if v >= 0
+            acc = (acc << 6) | v
+            bits = bits + 6
+            if bits >= 8
+                bits = bits - 8
+                if o < outlen
+                    x = bytes_set_u8(out, o, (acc >> bits) & 255)
+                    o = o + 1
+        i = i + 1
+    bytes_view(out, 0, outlen)
+
+fn scram_bytes_of(s: String) -> Bytes ! alloc
+    b = bytes_new(str_len(s) + 1)
+    x = str_bytes_copy(b, 0, s)
+    b
+
+fn scram_nonce() -> String ! io, alloc
+    raw = bytes_new(18)
+    x = getrandom_buf(raw, 18)
+    b64_encode(raw)
+
+# Valor del atributo `k=` en una lista "r=..,s=..,i=..".
+fn scram_attr(msg: String, key: String) -> String ! alloc
+    n = str_len(msg)
+    start = 0
+    while start < n
+        e = sk_index_from(msg, ",", start)
+        if e < 0
+            e = n
+        part = str_slice(msg, start, e)
+        if str_len(part) > 2
+            if str_char(part, 0) == str_char(key, 0)
+                if str_char(part, 1) == 61
+                    return str_slice(part, 2, str_len(part))
+        start = e + 1
+    ""
+
+# Prueba de cliente y firma esperada del servidor.
+struct ScramProof
+    final: String
+    server_sig: String
+    err: String
+
+fn scram_fail(why: String) -> ScramProof ! alloc
+    ScramProof("", "", why)
+
+# Calcula el mensaje client-final a partir de client-first-bare y server-first.
+fn scram_proof(password: String, client_first_bare: String, client_nonce: String, server_first: String) -> ScramProof ! alloc
+    rnonce = scram_attr(server_first, "r")
+    salt_b64 = scram_attr(server_first, "s")
+    iters = sk_parse_int(scram_attr(server_first, "i"))
+    if sk_starts_with(rnonce, client_nonce) == 0
+        return scram_fail("SCRAM: el nonce del servidor no extiende el del cliente")
+    if iters <= 0
+        return scram_fail("SCRAM: número de iteraciones inválido")
+    salt = b64_decode(salt_b64)
+    pw = scram_bytes_of(password)
+    salted = pbkdf2_sha256(pw, str_len(password), salt, bytes_len(salt), iters)
+    ckey = hmac_sha256(salted, 32, scram_bytes_of("Client Key"), 10)
+    stored = sha256(ckey, 32)
+    without_proof = "c=biws,r=" + rnonce
+    auth_message = client_first_bare + "," + server_first + "," + without_proof
+    am = scram_bytes_of(auth_message)
+    csig = hmac_sha256(stored, 32, am, str_len(auth_message))
+    proof = bytes_new(32)
+    i = 0
+    while i < 32
+        x = bytes_set_u8(proof, i, bytes_get_u8(ckey, i) ^ bytes_get_u8(csig, i))
+        i = i + 1
+    skey = hmac_sha256(salted, 32, scram_bytes_of("Server Key"), 10)
+    ssig = hmac_sha256(skey, 32, am, str_len(auth_message))
+    ScramProof(without_proof + ",p=" + b64_encode(proof), b64_encode(ssig), "")
